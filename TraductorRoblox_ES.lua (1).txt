@@ -1,0 +1,735 @@
+--[[
+╔══════════════════════════════════════════════════════════════╗
+║         ROBLOX TRADUCTOR EN TIEMPO REAL  🌐                  ║
+║         Inglés → Español  |  Mobile & PC                     ║
+║         Compatible: Synapse X · KRNL · Delta · Arceus X     ║
+║                     Fluxus · Codex · Hydrogen               ║
+╚══════════════════════════════════════════════════════════════╝
+
+  USO: Pega este script en tu executor y ejecútalo.
+  El panel flotante aparecerá en pantalla.
+  Puedes arrastrarlo con el dedo para moverlo.
+
+  API de traducción: MyMemory (Gratuita, sin API Key)
+  Límite gratuito: ~5000 palabras/día
+
+]]
+
+-- ══════════════════════════════════════════════════════════════
+--                      CONFIGURACIÓN
+-- ══════════════════════════════════════════════════════════════
+local CONFIG = {
+    IDIOMA_ORIGEN      = "en",   -- Idioma del juego (inglés)
+    IDIOMA_DESTINO     = "es",   -- Idioma destino (español)
+    INTERVALO_SCAN     = 3.5,    -- Segundos entre escaneos completos
+    MIN_CHARS          = 3,      -- Mínimo de caracteres para traducir
+    MAX_CHARS          = 450,    -- Máximo de caracteres por texto
+    MAX_LOGS           = 30,     -- Máx. entradas en el panel de log
+    MODO_DIRECTO       = true,   -- true = reemplaza texto en el juego
+                                 -- false = solo muestra en el panel
+    MOSTRAR_PANEL      = true,   -- Mostrar/ocultar panel flotante
+    AUTO_SCROLL        = true,   -- Auto-scroll al log más reciente
+}
+
+-- ══════════════════════════════════════════════════════════════
+--                      SERVICIOS
+-- ══════════════════════════════════════════════════════════════
+local Players       = game:GetService("Players")
+local RunService    = game:GetService("RunService")
+local TweenService  = game:GetService("TweenService")
+
+local LocalPlayer   = Players.LocalPlayer
+local PlayerGui     = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ══════════════════════════════════════════════════════════════
+--                        ESTADO
+-- ══════════════════════════════════════════════════════════════
+local Cache           = {}   -- Caché: texto_orig → texto_traducido
+local LogCache        = {}   -- Evita loguear duplicados
+local TextoOriginal   = {}   -- Instancia → texto original
+local Activo          = true
+local Traduciendo     = false
+
+local Contadores = {
+    traducidos = 0,
+    enCache    = 0,
+    elementos  = 0,
+}
+
+-- Referencias UI
+local UI_Panel, UI_Status, UI_Counter, UI_LogScroll
+local UI_BtnToggle, UI_BtnMini
+local LogEntries  = {}
+local LogOrder    = 1
+local Minimizado  = false
+
+-- ══════════════════════════════════════════════════════════════
+--              CAPA HTTP  (MULTI-EXECUTOR)
+-- ══════════════════════════════════════════════════════════════
+--  Detecta automáticamente qué función HTTP tiene el executor.
+local function ObtenerFnHTTP()
+    if request         then return request         end
+    if http_request    then return http_request    end
+    if syn and syn.request                then return syn.request         end
+    if http and http.request              then return http.request        end
+    if fluxus and fluxus.request          then return fluxus.request      end
+    if getgenv().request                  then return getgenv().request   end
+    return nil
+end
+
+local FnHTTP = ObtenerFnHTTP()
+
+local function Solicitar(url)
+    if not FnHTTP then return nil, "sin_http" end
+    local ok, res = pcall(FnHTTP, {
+        Url     = url,
+        Method  = "GET",
+        Headers = { ["User-Agent"] = "Mozilla/5.0 (compatible; RobloxTranslator/1.0)" },
+    })
+    if ok and res then
+        return (res.Body or res.body), nil
+    end
+    return nil, "error_red"
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               CODIFICACIÓN DE URL
+-- ══════════════════════════════════════════════════════════════
+local function URLEncode(str)
+    if not str then return "" end
+    str = tostring(str):gsub("\n", " "):gsub("\r", "")
+    str = str:gsub("[^%w%-%_%.%~%! ]", function(c)
+        return ("%%%02X"):format(c:byte())
+    end)
+    return str:gsub(" ", "%%20")
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               PARSER JSON LIGERO
+-- ══════════════════════════════════════════════════════════════
+local function ExtraerTraduccion(json)
+    if not json then return nil end
+    -- MyMemory responde con "translatedText":"..."
+    local t = json:match('"translatedText"%s*:%s*"(.-[^\\])"')
+           or json:match('"translatedText"%s*:%s*"()"')
+    if t then
+        -- Decodificar escapes básicos
+        t = t:gsub("\\n", "\n")
+             :gsub("\\t", "\t")
+             :gsub('\\"', '"')
+             :gsub("\\\\", "\\")
+        return t ~= "" and t or nil
+    end
+    return nil
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               NÚCLEO DE TRADUCCIÓN
+-- ══════════════════════════════════════════════════════════════
+--  Filtra, consulta MyMemory y guarda en caché.
+local function Traducir(texto)
+    if not texto or type(texto) ~= "string" then return texto end
+
+    -- Limpiar espacios externos
+    texto = texto:match("^%s*(.-)%s*$")
+
+    -- Filtros rápidos (sin API call)
+    if #texto < CONFIG.MIN_CHARS                then return texto end
+    if #texto > CONFIG.MAX_CHARS                then return texto end
+    if texto:match("^[%d%s%p]+$")               then return texto end  -- solo números
+    if texto:match("^[%d]+[%/:][%d]+")          then return texto end  -- fechas/horas
+    if texto:match("^https?://")                 then return texto end  -- URLs
+    if texto:match("^[%u%d_]+$") and #texto < 6 then return texto end  -- siglas cortas
+
+    -- Caché
+    if Cache[texto] then return Cache[texto] end
+
+    -- Llamada a la API
+    local par = CONFIG.IDIOMA_ORIGEN .. "|" .. CONFIG.IDIOMA_DESTINO
+    local url = "https://api.mymemory.translated.net/get?q="
+                .. URLEncode(texto)
+                .. "&langpair=" .. par
+
+    local cuerpo, err = Solicitar(url)
+    if err then return texto end
+
+    local traducido = ExtraerTraduccion(cuerpo)
+    if traducido and traducido ~= texto and #traducido > 0 then
+        Cache[texto]     = traducido
+        Contadores.enCache = Contadores.enCache + 1
+        return traducido
+    end
+
+    return texto
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               INTERFAZ GRÁFICA  (MOBILE-FIRST)
+-- ══════════════════════════════════════════════════════════════
+local function CrearUI()
+    -- Eliminar UI anterior si existe
+    local prev = PlayerGui:FindFirstChild("TraductorRBX_UI")
+    if prev then prev:Destroy() end
+
+    -------------------------------------------------------
+    -- ScreenGui raíz
+    -------------------------------------------------------
+    local Screen = Instance.new("ScreenGui")
+    Screen.Name            = "TraductorRBX_UI"
+    Screen.ResetOnSpawn    = false
+    Screen.DisplayOrder    = 9999
+    Screen.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+    Screen.IgnoreGuiInset  = false
+    Screen.Parent          = PlayerGui
+
+    -------------------------------------------------------
+    -- Panel contenedor principal
+    -------------------------------------------------------
+    local Panel = Instance.new("Frame")
+    Panel.Name                  = "Panel"
+    Panel.Size                  = UDim2.new(0, 305, 0, 415)
+    Panel.Position              = UDim2.new(0, 8, 0.5, -207)
+    Panel.BackgroundColor3      = Color3.fromRGB(11, 11, 20)
+    Panel.BackgroundTransparency = 0.04
+    Panel.BorderSizePixel       = 0
+    Panel.Active                = true
+    Panel.Draggable             = true
+    Panel.Parent                = Screen
+    UI_Panel = Panel
+
+    do  -- Esquinas redondeadas
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 14); c.Parent = Panel
+    end
+    do  -- Borde morado
+        local b = Instance.new("UIStroke")
+        b.Color = Color3.fromRGB(90, 45, 190); b.Thickness = 1.8; b.Parent = Panel
+    end
+
+    -------------------------------------------------------
+    -- Header con gradiente
+    -------------------------------------------------------
+    local Header = Instance.new("Frame")
+    Header.Name             = "Header"
+    Header.Size             = UDim2.new(1, 0, 0, 54)
+    Header.BackgroundColor3 = Color3.fromRGB(55, 25, 145)
+    Header.BorderSizePixel  = 0
+    Header.ZIndex           = 3
+    Header.Parent           = Panel
+
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 14); c.Parent = Header
+    end
+    do  -- Tapar esquinas inferiores del header
+        local fix = Instance.new("Frame")
+        fix.Size             = UDim2.new(1, 0, 0.5, 0)
+        fix.Position         = UDim2.new(0, 0, 0.5, 0)
+        fix.BackgroundColor3 = Color3.fromRGB(55, 25, 145)
+        fix.BorderSizePixel  = 0
+        fix.ZIndex           = 2
+        fix.Parent           = Header
+    end
+    do  -- Gradiente
+        local g = Instance.new("UIGradient")
+        g.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(95, 45, 215)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(35, 95, 225)),
+        })
+        g.Rotation = 88; g.Parent = Header
+    end
+
+    -- Ícono globo
+    local IcoGlobo = Instance.new("TextLabel")
+    IcoGlobo.Text               = "🌐"
+    IcoGlobo.Size               = UDim2.new(0, 38, 0, 38)
+    IcoGlobo.Position           = UDim2.new(0, 10, 0.5, -19)
+    IcoGlobo.BackgroundTransparency = 1
+    IcoGlobo.TextScaled         = true
+    IcoGlobo.ZIndex             = 4
+    IcoGlobo.Parent             = Header
+
+    -- Título
+    local Titulo = Instance.new("TextLabel")
+    Titulo.Text                = "Traductor EN → ES"
+    Titulo.Size                = UDim2.new(1, -105, 0, 24)
+    Titulo.Position            = UDim2.new(0, 52, 0, 8)
+    Titulo.BackgroundTransparency = 1
+    Titulo.TextColor3          = Color3.fromRGB(255, 255, 255)
+    Titulo.TextScaled          = true
+    Titulo.Font                = Enum.Font.GothamBold
+    Titulo.TextXAlignment      = Enum.TextXAlignment.Left
+    Titulo.ZIndex              = 4
+    Titulo.Parent              = Header
+
+    local SubTitulo = Instance.new("TextLabel")
+    SubTitulo.Text             = "● MyMemory API · Tiempo Real"
+    SubTitulo.Size             = UDim2.new(1, -105, 0, 16)
+    SubTitulo.Position         = UDim2.new(0, 52, 0, 32)
+    SubTitulo.BackgroundTransparency = 1
+    SubTitulo.TextColor3       = Color3.fromRGB(190, 170, 255)
+    SubTitulo.TextScaled       = true
+    SubTitulo.Font             = Enum.Font.Gotham
+    SubTitulo.TextXAlignment   = Enum.TextXAlignment.Left
+    SubTitulo.ZIndex           = 4
+    SubTitulo.Parent           = Header
+
+    -- Botón TOGGLE (Pausar / Reanudar)
+    UI_BtnToggle = Instance.new("TextButton")
+    UI_BtnToggle.Text              = "⏸"
+    UI_BtnToggle.Size              = UDim2.new(0, 36, 0, 36)
+    UI_BtnToggle.Position          = UDim2.new(1, -82, 0.5, -18)
+    UI_BtnToggle.BackgroundColor3  = Color3.fromRGB(255, 255, 255)
+    UI_BtnToggle.BackgroundTransparency = 0.75
+    UI_BtnToggle.TextColor3        = Color3.fromRGB(255, 255, 255)
+    UI_BtnToggle.TextScaled        = true
+    UI_BtnToggle.Font              = Enum.Font.GothamBold
+    UI_BtnToggle.BorderSizePixel   = 0
+    UI_BtnToggle.ZIndex            = 5
+    UI_BtnToggle.Parent            = Header
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 9); c.Parent = UI_BtnToggle
+    end
+
+    -- Botón MINIMIZAR
+    UI_BtnMini = Instance.new("TextButton")
+    UI_BtnMini.Text             = "▼"
+    UI_BtnMini.Size             = UDim2.new(0, 36, 0, 36)
+    UI_BtnMini.Position         = UDim2.new(1, -42, 0.5, -18)
+    UI_BtnMini.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    UI_BtnMini.BackgroundTransparency = 0.75
+    UI_BtnMini.TextColor3       = Color3.fromRGB(255, 255, 255)
+    UI_BtnMini.TextScaled       = true
+    UI_BtnMini.Font             = Enum.Font.GothamBold
+    UI_BtnMini.BorderSizePixel  = 0
+    UI_BtnMini.ZIndex           = 5
+    UI_BtnMini.Parent           = Header
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 9); c.Parent = UI_BtnMini
+    end
+
+    -------------------------------------------------------
+    -- Cuerpo (debajo del header)
+    -------------------------------------------------------
+    local Body = Instance.new("Frame")
+    Body.Name                   = "Body"
+    Body.Size                   = UDim2.new(1, -16, 1, -62)
+    Body.Position               = UDim2.new(0, 8, 0, 58)
+    Body.BackgroundTransparency = 1
+    Body.Parent                 = Panel
+
+    -- Barra de estado
+    local StatusBar = Instance.new("Frame")
+    StatusBar.Size             = UDim2.new(1, 0, 0, 34)
+    StatusBar.BackgroundColor3 = Color3.fromRGB(18, 18, 36)
+    StatusBar.BorderSizePixel  = 0
+    StatusBar.Parent           = Body
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 9); c.Parent = StatusBar
+    end
+
+    -- Indicador de estado (texto izquierda)
+    UI_Status = Instance.new("TextLabel")
+    UI_Status.Name             = "StatusText"
+    UI_Status.Text             = "⏳ Iniciando..."
+    UI_Status.Size             = UDim2.new(0.6, -6, 1, 0)
+    UI_Status.Position         = UDim2.new(0, 10, 0, 0)
+    UI_Status.BackgroundTransparency = 1
+    UI_Status.TextColor3       = Color3.fromRGB(255, 200, 60)
+    UI_Status.TextScaled       = true
+    UI_Status.Font             = Enum.Font.Gotham
+    UI_Status.TextXAlignment   = Enum.TextXAlignment.Left
+    UI_Status.Parent           = StatusBar
+
+    -- Contadores (texto derecha)
+    UI_Counter = Instance.new("TextLabel")
+    UI_Counter.Name            = "CounterText"
+    UI_Counter.Text            = "0 ✓  |  0 📦"
+    UI_Counter.Size            = UDim2.new(0.4, -6, 1, 0)
+    UI_Counter.Position        = UDim2.new(0.6, 0, 0, 0)
+    UI_Counter.BackgroundTransparency = 1
+    UI_Counter.TextColor3      = Color3.fromRGB(150, 150, 185)
+    UI_Counter.TextScaled      = true
+    UI_Counter.Font            = Enum.Font.Gotham
+    UI_Counter.TextXAlignment  = Enum.TextXAlignment.Right
+    UI_Counter.Parent          = StatusBar
+
+    -- Contenedor del log
+    local LogBox = Instance.new("Frame")
+    LogBox.Name                = "LogBox"
+    LogBox.Size                = UDim2.new(1, 0, 1, -42)
+    LogBox.Position            = UDim2.new(0, 0, 0, 40)
+    LogBox.BackgroundColor3    = Color3.fromRGB(15, 15, 28)
+    LogBox.BorderSizePixel     = 0
+    LogBox.ClipsDescendants    = true
+    LogBox.Parent              = Body
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 11); c.Parent = LogBox
+    end
+
+    UI_LogScroll = Instance.new("ScrollingFrame")
+    UI_LogScroll.Name                = "LogScroll"
+    UI_LogScroll.Size                = UDim2.new(1, -8, 1, -8)
+    UI_LogScroll.Position            = UDim2.new(0, 4, 0, 4)
+    UI_LogScroll.BackgroundTransparency = 1
+    UI_LogScroll.BorderSizePixel     = 0
+    UI_LogScroll.ScrollBarThickness  = 3
+    UI_LogScroll.ScrollBarImageColor3 = Color3.fromRGB(85, 40, 190)
+    UI_LogScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    UI_LogScroll.CanvasSize          = UDim2.new(0, 0, 0, 0)
+    UI_LogScroll.Parent              = LogBox
+
+    local Layout = Instance.new("UIListLayout")
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Padding   = UDim.new(0, 5)
+    Layout.Parent    = UI_LogScroll
+
+    local Pad = Instance.new("UIPadding")
+    Pad.PaddingTop    = UDim.new(0, 6)
+    Pad.PaddingBottom = UDim.new(0, 6)
+    Pad.PaddingLeft   = UDim.new(0, 4)
+    Pad.PaddingRight  = UDim.new(0, 4)
+    Pad.Parent        = UI_LogScroll
+
+    -- Encabezado del log
+    local LogHeader = Instance.new("TextLabel")
+    LogHeader.Text              = "📋  Historial de Traducciones"
+    LogHeader.Size              = UDim2.new(1, 0, 0, 22)
+    LogHeader.BackgroundTransparency = 1
+    LogHeader.TextColor3        = Color3.fromRGB(105, 55, 215)
+    LogHeader.TextScaled        = true
+    LogHeader.Font              = Enum.Font.GothamBold
+    LogHeader.TextXAlignment    = Enum.TextXAlignment.Left
+    LogHeader.LayoutOrder       = 0
+    LogHeader.Parent            = UI_LogScroll
+
+    -------------------------------------------------------
+    -- Lógica de botones
+    -------------------------------------------------------
+    UI_BtnToggle.MouseButton1Click:Connect(function()
+        Activo = not Activo
+        if Activo then
+            UI_BtnToggle.Text = "⏸"
+            UI_Status.Text    = "● Activo"
+            UI_Status.TextColor3 = Color3.fromRGB(80, 220, 120)
+        else
+            UI_BtnToggle.Text = "▶"
+            UI_Status.Text    = "⏸ Pausado"
+            UI_Status.TextColor3 = Color3.fromRGB(220, 180, 40)
+        end
+    end)
+
+    UI_BtnMini.MouseButton1Click:Connect(function()
+        Minimizado = not Minimizado
+        if Minimizado then
+            UI_BtnMini.Text = "▲"
+            TweenService:Create(Panel,
+                TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+                { Size = UDim2.new(0, 305, 0, 54) }
+            ):Play()
+        else
+            UI_BtnMini.Text = "▼"
+            TweenService:Create(Panel,
+                TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+                { Size = UDim2.new(0, 305, 0, 415) }
+            ):Play()
+        end
+    end)
+
+    return Screen
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               LOG: AGREGAR ENTRADA
+-- ══════════════════════════════════════════════════════════════
+local function AgregarLog(original, traducido)
+    if not UI_LogScroll then return end
+
+    LogOrder = LogOrder + 1
+
+    local Entrada = Instance.new("Frame")
+    Entrada.Size             = UDim2.new(1, -4, 0, 62)
+    Entrada.BackgroundColor3 = Color3.fromRGB(22, 22, 42)
+    Entrada.BorderSizePixel  = 0
+    Entrada.LayoutOrder      = LogOrder
+    Entrada.Parent           = UI_LogScroll
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 8); c.Parent = Entrada
+    end
+
+    -- Línea de acento izquierda
+    local Acento = Instance.new("Frame")
+    Acento.Size             = UDim2.new(0, 3, 1, -10)
+    Acento.Position         = UDim2.new(0, 0, 0, 5)
+    Acento.BackgroundColor3 = Color3.fromRGB(90, 45, 200)
+    Acento.BorderSizePixel  = 0
+    Acento.Parent           = Entrada
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 3); c.Parent = Acento
+    end
+
+    -- Texto original (inglés)
+    local TxtOrig = Instance.new("TextLabel")
+    TxtOrig.Text             = "🇺🇸  " .. (original:sub(1, 38)) .. (original:len() > 38 and "…" or "")
+    TxtOrig.Size             = UDim2.new(1, -14, 0.5, -1)
+    TxtOrig.Position         = UDim2.new(0, 9, 0, 2)
+    TxtOrig.BackgroundTransparency = 1
+    TxtOrig.TextColor3       = Color3.fromRGB(130, 130, 165)
+    TxtOrig.TextScaled       = true
+    TxtOrig.Font             = Enum.Font.Gotham
+    TxtOrig.TextXAlignment   = Enum.TextXAlignment.Left
+    TxtOrig.TextTruncate     = Enum.TextTruncate.AtEnd
+    TxtOrig.Parent           = Entrada
+
+    -- Texto traducido (español)
+    local TxtTrad = Instance.new("TextLabel")
+    TxtTrad.Text             = "🇪🇸  " .. (traducido:sub(1, 38)) .. (traducido:len() > 38 and "…" or "")
+    TxtTrad.Size             = UDim2.new(1, -14, 0.5, -1)
+    TxtTrad.Position         = UDim2.new(0, 9, 0.5, 1)
+    TxtTrad.BackgroundTransparency = 1
+    TxtTrad.TextColor3       = Color3.fromRGB(110, 205, 255)
+    TxtTrad.TextScaled       = true
+    TxtTrad.Font             = Enum.Font.GothamBold
+    TxtTrad.TextXAlignment   = Enum.TextXAlignment.Left
+    TxtTrad.TextTruncate     = Enum.TextTruncate.AtEnd
+    TxtTrad.Parent           = Entrada
+
+    table.insert(LogEntries, Entrada)
+
+    -- Eliminar entradas antiguas cuando se supera el límite
+    if #LogEntries > CONFIG.MAX_LOGS then
+        local vieja = table.remove(LogEntries, 1)
+        if vieja and vieja.Parent then vieja:Destroy() end
+    end
+
+    -- Auto-scroll al final
+    if CONFIG.AUTO_SCROLL then
+        task.delay(0.06, function()
+            if UI_LogScroll then
+                UI_LogScroll.CanvasPosition = Vector2.new(0, math.huge)
+            end
+        end)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               ACTUALIZAR BARRA DE ESTADO
+-- ══════════════════════════════════════════════════════════════
+local function ActualizarEstado(texto, color)
+    if UI_Status then
+        UI_Status.Text      = texto
+        UI_Status.TextColor3 = color or Color3.fromRGB(80, 220, 120)
+    end
+    if UI_Counter then
+        UI_Counter.Text = Contadores.traducidos .. " ✓  |  " .. Contadores.enCache .. " 📦"
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               RECOLECTOR DE INSTANCIAS DE TEXTO
+-- ══════════════════════════════════════════════════════════════
+local function ObtenerTextos(padre)
+    local lista = {}
+    local function Buscar(obj)
+        local ok, hijos = pcall(function() return obj:GetChildren() end)
+        if not ok then return end
+        for _, hijo in ipairs(hijos) do
+            if hijo:IsA("TextLabel") or hijo:IsA("TextButton") or hijo:IsA("TextBox") then
+                if hijo.Text and #hijo.Text >= CONFIG.MIN_CHARS then
+                    lista[#lista + 1] = hijo
+                end
+            end
+            if #hijo:GetChildren() > 0 then
+                Buscar(hijo)
+            end
+        end
+    end
+    Buscar(padre)
+    return lista
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               ESCANEO Y TRADUCCIÓN COMPLETA
+-- ══════════════════════════════════════════════════════════════
+local function EscanearYTraducir()
+    if Traduciendo or not Activo then return end
+    Traduciendo = true
+
+    ActualizarEstado("⟳ Escaneando...", Color3.fromRGB(255, 200, 50))
+
+    -- Recolectar desde PlayerGui
+    local instancias = ObtenerTextos(PlayerGui)
+
+    -- Intentar también CoreGui
+    pcall(function()
+        local core = ObtenerTextos(game.CoreGui)
+        for _, v in ipairs(core) do instancias[#instancias + 1] = v end
+    end)
+
+    Contadores.elementos = #instancias
+
+    for _, inst in ipairs(instancias) do
+        if not inst or not inst.Parent then continue end
+
+        local textoActual = inst.Text
+        if not textoActual or #textoActual < CONFIG.MIN_CHARS then continue end
+
+        -- Registrar texto original si aún no existe
+        if not TextoOriginal[inst] then
+            TextoOriginal[inst] = textoActual
+        end
+
+        local orig      = TextoOriginal[inst]
+        local traducido = Traducir(orig)
+
+        if traducido ~= orig and #traducido > 0 then
+            -- Aplicar directamente al elemento del juego
+            if CONFIG.MODO_DIRECTO then
+                local ok = pcall(function()
+                    if inst.Parent and (inst.Text == orig or inst.Text == "") then
+                        inst.Text = traducido
+                    end
+                end)
+            end
+
+            Contadores.traducidos = Contadores.traducidos + 1
+
+            -- Registrar en el log (sin duplicados)
+            if not LogCache[orig] then
+                LogCache[orig] = true
+                AgregarLog(orig, traducido)
+            end
+        end
+
+        task.wait(0.02) -- pequeña pausa para no bloquear el cliente
+    end
+
+    ActualizarEstado("● " .. Contadores.elementos .. " elementos", Color3.fromRGB(80, 220, 120))
+    Traduciendo = false
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               WATCHER  (DETECCIÓN EN TIEMPO REAL)
+-- ══════════════════════════════════════════════════════════════
+--  Se conecta a DescendantAdded y a los cambios de propiedad
+--  "Text" para traducir dialogs, tooltips y popups al instante.
+local function IniciarWatcher(padre)
+    pcall(function()
+        padre.DescendantAdded:Connect(function(desc)
+            if not Activo then return end
+            if not (desc:IsA("TextLabel") or desc:IsA("TextButton") or desc:IsA("TextBox")) then return end
+
+            task.wait(0.18) -- esperar a que el juego asigne el texto
+
+            local texto = desc.Text
+            if not texto or #texto < CONFIG.MIN_CHARS then return end
+
+            local orig     = texto
+            local traducido = Traducir(orig)
+
+            if traducido ~= orig then
+                TextoOriginal[desc] = orig
+
+                if CONFIG.MODO_DIRECTO then
+                    pcall(function() desc.Text = traducido end)
+                end
+
+                Contadores.traducidos = Contadores.traducidos + 1
+                ActualizarEstado("● " .. Contadores.elementos .. " elem.")
+
+                if not LogCache[orig] then
+                    LogCache[orig] = true
+                    AgregarLog(orig, traducido)
+                end
+            end
+
+            -- Vigilar cambios futuros en ESTE elemento
+            pcall(function()
+                desc:GetPropertyChangedSignal("Text"):Connect(function()
+                    if not Activo or not desc.Parent then return end
+                    task.wait(0.1)
+
+                    local nuevo = desc.Text
+                    if not nuevo or #nuevo < CONFIG.MIN_CHARS then return end
+
+                    -- Si ya es la traducción guardada, ignorar
+                    if TextoOriginal[desc] and Cache[TextoOriginal[desc]] == nuevo then return end
+
+                    -- El juego actualizó el texto: retraducir
+                    TextoOriginal[desc] = nuevo
+                    local nuevoTrad = Traducir(nuevo)
+
+                    if nuevoTrad ~= nuevo then
+                        pcall(function() desc.Text = nuevoTrad end)
+                        if not LogCache[nuevo] then
+                            LogCache[nuevo] = true
+                            AgregarLog(nuevo, nuevoTrad)
+                        end
+                    end
+                end)
+            end)
+        end)
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--               FUNCIÓN PRINCIPAL
+-- ══════════════════════════════════════════════════════════════
+local function Iniciar()
+    -- Crear interfaz
+    if CONFIG.MOSTRAR_PANEL then
+        CrearUI()
+    end
+
+    -- Verificar soporte HTTP
+    if not FnHTTP then
+        ActualizarEstado("⚠ Sin HTTP  – Usa Delta/Arceus X/KRNL", Color3.fromRGB(240, 70, 70))
+        warn("═══════════════════════════════════════════════════")
+        warn("  [Traductor] ⚠️  No se detectó función HTTP.")
+        warn("  Executors compatibles con mobile:")
+        warn("    • Delta (anteriormente Hydrogen)")
+        warn("    • Arceus X")
+        warn("    • Fluxus")
+        warn("    • Codex")
+        warn("  En PC también: Synapse X, KRNL, Script-Ware")
+        warn("═══════════════════════════════════════════════════")
+        return
+    end
+
+    ActualizarEstado("🔗 Watchers activos...", Color3.fromRGB(255, 200, 50))
+
+    -- Iniciar watchers de PlayerGui y CoreGui
+    IniciarWatcher(PlayerGui)
+    pcall(function() IniciarWatcher(game.CoreGui) end)
+
+    -- Primer escaneo completo (dar tiempo al juego de cargar)
+    task.wait(1.2)
+    EscanearYTraducir()
+
+    -- Loop de escaneos periódicos (por si algún texto se perdió)
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.INTERVALO_SCAN)
+            EscanearYTraducir()
+        end
+    end)
+
+    -- Imprimir confirmación en la consola del executor
+    print("═══════════════════════════════════════════════════")
+    print("  🌐 Traductor EN→ES iniciado correctamente ✅")
+    print("  Modo: " .. (CONFIG.MODO_DIRECTO and "Directo (reemplaza texto)" or "Solo panel"))
+    print("  API: MyMemory (gratuita)")
+    print("  Intervalo de escaneo: " .. CONFIG.INTERVALO_SCAN .. "s")
+    print("  El panel es ARRASTRABLE con el dedo.")
+    print("  ⏸ = Pausar  |  ▼ = Minimizar")
+    print("═══════════════════════════════════════════════════")
+end
+
+-- Ejecutar en un hilo separado para no bloquear el executor
+task.spawn(Iniciar)
